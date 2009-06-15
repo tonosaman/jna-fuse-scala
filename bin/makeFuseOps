@@ -1,0 +1,240 @@
+#!/bin/sh
+exec scala -cp /local/lib/java/jna.jar:./out $0 $@ 
+!#
+
+// sample input:
+//
+// int (*getattr) (const char *, struct stat *);
+// int (*readlink) (const char *, char *, size_t);
+// int (*getdir) (const char *, fuse_dirh_t, fuse_dirfil_t); // deprecated
+// int (*mknod) (const char *, mode_t, dev_t);
+//
+// int fuse_fs_getattr(struct fuse_fs *fs, const char *path, struct stat *buf);
+// int fuse_fs_fgetattr(struct fuse_fs *fs, const char *path, struct stat *buf,
+//         struct fuse_file_info *fi);
+
+import scala.io._
+import scala.util.matching.Regex
+import scala.collection.mutable.{ ListBuffer, HashMap, Stack }
+import org.improving.fuse.CSizes
+
+val deprecated = List("getdir", "utime")
+val in = Source.fromFile("src/include/fuse.h")
+// val doJava = argv.size == 1 && argv(0) == "java"
+
+// the fold joins defs broken across multiple lines by looking for nonmatching parens
+val lines = {
+  in.getLines.mkString
+  . replaceAll("""/\*(.|[\r\n])*?\*/""", "")  // remove comments
+  . split("""\n""")                           // back into lines
+  . map(_.trim)                               // remove whitespace
+  . filter(_ != "")                           // remove empty lines
+  . foldRight(List[String]()) { (x, xs) =>
+      if (!xs.isEmpty && (xs.head.filter(_ == '(').size != xs.head.filter(_ == ')').size))
+        x + " " + xs.head :: xs.tail
+      else x :: xs
+    }
+}
+
+// our callback structure needs to exactly match struct fuse_operations,
+// so that is the canonical source for contents and ordering
+val fuseopLines = {
+  val fuseopWithDups = {
+    lines
+    . dropWhile(x => !x.startsWith("struct fuse_operations {")).tail
+    . takeWhile(_ != "};").init
+    . filter(x => !x.startsWith("#"))   // XXX for now we drop all cpp directives and use first seen
+  }
+  
+  // make a list of just the names, an ignore any we've already seen  
+  def fuseopName(s: String) = s.replaceAll("""^[^(]*\((.*?)\).*""", "$1")
+  val fuseopNames = fuseopWithDups map fuseopName
+  
+  for {
+    (op, i) <- fuseopWithDups.zipWithIndex
+    val name = fuseopName(op)
+    if (!fuseopNames.slice(0, i).contains(name))
+  }
+  yield op
+}
+
+// XXX temporary sanity check
+assert(fuseopLines.size == 58)
+  
+val FunctionPointer = new Regex("""^([^(]*)\s*\(\*(\S+)\)\s*\((.*)\)(.*)""")
+val FusePrototype = new Regex("""^\S+\s+fuse_fs_(\w+)\(struct fuse_fs [^,]*,(.*)\).*""")
+
+case class Type(s: String) {
+  val ctype: String = s.trim
+  val jnatype: String = ctype match {
+    case "const char *" => "String"
+    case "struct utimbuf *" => "Pointer"
+    case "fuse_fill_dir_t" => "FuseFillDirT"
+    case "int" | "int32_t" | "uint32_t" => "int"
+    case "int64_t" | "uint64_t" => "long"
+    case "short" => "short"
+    case "byte" => "byte"
+    case "double" => "double"
+    case "float" => "float"
+    case "void" => "void"
+    case "char" => "char"
+    // case "long" => "NativeLong"
+    case "long" => "int"
+    case s if s startsWith "const " => Type(s.substring(6)).jtype
+    case s if s startsWith "unsigned " => Type(s.substring(9)).jtype
+    case s if s startsWith "struct " => mkStructType(s)
+    case s if s endsWith "*" => "Pointer"
+    case s => s
+  }
+  val jtype: String = CSizes.sizeOf(jnatype) match {
+    case 8  => "long"
+    case 4  => "int"  
+    case 2  => "short"
+    case 1  => "byte"
+    case _  => jnatype
+  }
+
+  val stype: String = jtype match {
+    case "int" | "long" | "short" | "byte" | "double" | "float" | "char" => jtype.capitalize
+    case "void" => "Unit"
+    case s => s
+  }
+  
+  private def mkStructType(s: String): String = {
+    val lb = new ListBuffer[Char]
+    val letters = new Stack[Char] 
+    letters ++= s.toList.reverse
+
+    lb += letters.pop.toUpperCase // first letter
+    while (!letters.isEmpty) {
+      var c = letters.pop
+      if (c == '[')
+        return lb.mkString
+      if (c == '_' || c == ' ')
+        c = letters.pop.toUpperCase
+      if (c != '*')
+        lb += c
+    }
+    lb.mkString
+  }
+}
+
+case class Parameter(name: String, t: Type) {
+  val byValue = false;
+  val isArray = false;
+  
+  def arrayWrap(s: String): String = if (isArray) "Array[" + s + "]" else s
+  def stype: String = {
+    val atype = if (name == "buf" && t.stype == "String") "Pointer" else t.stype
+    val s = arrayWrap(atype)
+    if (byValue) s + ".ByValue" else s
+  }
+}
+
+case class Method(name: String, params: List[Parameter], returnType: Type) {
+  def paramString = params.map(x => x.name + ": " + x.stype) mkString ", "
+  def retString = returnType.stype
+  def funString =  "(" + paramString + "): " + retString
+  
+  def defaultImpl = retString match {
+    case "Int"    => "-ENOSYS"
+    case "Unit"   => "{ }"
+    case _        => "null"
+  }  
+}
+
+// associate function names with parameter names based on what fuse prototypes we can find
+val parameterLists = new HashMap[String, List[Parameter]]
+for (FusePrototype(method, params) <- lines) {
+  val ps = params.split(",").map(_.trim).toList
+  // have to finnesse the split between type name and parameter name
+  val pairs = for (p <- ps) yield {
+    val List(ctype, cnameOrig) = p.replaceAll("""^(.*)(\s+|\*)(\S+)$""", "$1$2,$3").split(",").map(_.trim).toList
+    val cname = if (cnameOrig == method) "_" + cnameOrig else cnameOrig
+    
+    // a struct with no * or [ must be passed by value
+    if (ctype.contains("struct ") && (!cname.contains("[") && !ctype.contains("*")))
+      new Parameter(cname, Type(ctype)) { override val byValue = true }
+    else if (cname contains "[")
+      new Parameter(cname.replaceAll("""\[.*$""", ""), Type(ctype)) { override val isArray = true }
+    else
+      Parameter(cname, Type(ctype))
+  }
+  
+  // XXX for now ignore it if already seen
+  if (parameterLists.get(method).isEmpty)
+    parameterLists(method) = pairs
+}
+
+val methods: List[Method] =
+  for (FunctionPointer(retType, name, params, rest) <- fuseopLines) yield {
+    // either we can figure out the param names from a fuse prototype, or we call them p1/p2/etc
+    val pairs: List[Parameter] = parameterLists.get(name) match {
+      case Some(xs) => xs
+      case _ => 
+        val ctypes: List[Type] = params.split(",").map(_.trim).toList.map(Type)
+        val names = List.range(1, ctypes.size + 1).map("p" + _)
+        parameterLists(name) = List.map2(names, ctypes)(Parameter)
+        parameterLists(name)
+    }
+    
+    Method(name, pairs, Type(retType))
+  }
+
+def outputScala = {
+  // create the trait that users will use
+  println("""// DO NOT EDIT! Autogenerated by makeFuseOps
+package org.improving.fuse
+
+import com.sun.jna._
+import ptr._
+import Fuse._
+// import CommonStruct._
+import jnajava.Fuse._
+import jnajava.C._
+import Errno._
+import Fcntl._
+import CSizes._
+
+object GeneratedFuse {
+  trait Operations {
+""")
+  // 
+  // abstract class GeneratedFuseOps {
+  //   self: ScalaFS =>
+
+  // default implementation for each op
+  for (m @ Method(name, params, returnType) <- methods) {
+    println("    def " + name + m.funString + " = " + m.defaultImpl)
+  }
+  println("  }\n")
+  
+  // array index into Callback structure
+  println("  val callbackNames = Array(")
+  println(methods.map("    \"" + _.name + "\"").mkString(",\n"))
+  println("  )")
+  println("}")
+}
+
+// def outputJava = {
+//   println("public static class FuseOperations extends Structure {")
+//   
+//   // as far as I can tell, jna requires a named interface for each callback
+//   for (sp @ (name, paramString, retString) <- scalaPrototypes) {
+//     val pNamesOnly = parameterLists(name).map(_.name).mkString(", ")
+//     println("  interface " + name + "Interface extends Callback { def callback" + funString(sp) + "} ")
+//   }
+// 
+//   println(
+//     (for ((name, paramString, retString) <- scalaPrototypes) yield {
+//       val pNamesOnly = parameterLists(name).map(_.name).mkString(", ")
+//       "  public " + name + "Interface " + name + "Function = new " + name + "Interface() { public " 
+//       // "    new ScalaCallback { def callback(" + paramString + "): " + retString + " = self." + name +"(" + pNamesOnly +") } "
+//     }) mkString ",\n"
+//   )
+//   println("}")
+// }
+// 
+// if (doJava) outputJava else outputScala
+
+outputScala

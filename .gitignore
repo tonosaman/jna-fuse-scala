@@ -1,0 +1,7 @@
+/ext
+/extfs
+/pkg
+/out
+*.o
+*.class
+/src/tools

@@ -1,0 +1,22 @@
+
+*** CORE ***
+
+* scuse: generated fuse --> buf should be Pointer in def write()
+* combinator parser for C header files -> generate scala glue
+* convert to sbt (scalify too!)
+* capabilities? look at E again
+* scala compiler: use fuse mount to play games with classfiles
+
+*** FSes ***
+
+* mboxfs
+* unionfs - treat many dirs as one
+* make loopbacfsk naturally extensible
+* gitfs: given bare repo, mount checks it out and issues a commit for every write (see waybackfs)
+* filterfs: apply arbitrary byte[] -> byte[] and cpath -> cpath filters
+* xmlfs:  XML filesystem and DOM filesystem
+* jar finding filesystem: sees attempt to open /.../foo.jar and gets it  http://www.jarfinder.com/
+* strongly typed filesystem?
+* structured data in pipes?
+* launchdfs
+* sqlitefs
